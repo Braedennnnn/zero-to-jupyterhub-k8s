@@ -599,3 +599,75 @@ if os.path.isdir(config_dir):
 for key, config_py in sorted(get_config("hub.extraConfig", {}).items()):
     print(f"Loading extra config: {key}")
     exec(config_py)
+
+
+
+# def post_auth_profile_build(authenticator, handler, authentication):
+#     return authenticator.build_profile(handler, authentication)
+
+
+from tornado import gen
+
+spawner_git_server = get_config('hub.spawner.git_server')
+adv_groups = get_config('hub.spawner.adv_access')
+
+@gen.coroutine
+def spawner_config(spawner):
+    """
+    We are running ON THE HUB! Need to configure the mounts and stuff for the end user.
+
+    The startup scripts will have to do the rest.
+
+    1. Setup mounts and owners and paths and IDs
+    2. Pass data off to the container for build (spawner.environment dict)
+    """
+    auth_state = yield spawner.user.get_auth_state()
+
+    if auth_state is None or 'profile' not in auth_state:
+        # Lol the authenticator was not made to do this
+        yield spawner.user.save_auth_state(
+            spawner.authenticator.build_profile(
+                spawner.handler,
+                {
+                    'name': spawner.user.name,
+                    'auth_state': {
+                        'profile': {
+                            'dn': spawner.authenticator._user_dn_lookup(
+                                spawner.authenticator._build_connection(
+                                    spawner.authenticator.search_user_dn, spawner.authenticator.search_user_password
+                                ), spawner.user.name)  # May not work if there are normalization changes to the username
+                        }
+                    }
+                }).get('auth_state'))
+
+    auth_state = yield spawner.user.get_auth_state()
+
+    # Entrypoint of root seems to get smashed by this. Duh. Whoops.
+    spawner.uid = 0
+    spawner.gid = 0
+
+    #spawner.uid = auth_state['profile']['uid']
+    #spawner.gid = auth_state['profile']['gid']
+    spawner.fs_gid = auth_state['profile']['gid'] # I still don't get this one
+    spawner.supplemental_gids = auth_state['profile']['group_membership']
+    spawner.environment['NB_USER'] = spawner.user.name
+    spawner.environment['NB_UID'] = str(auth_state['profile']['uid'])
+    spawner.environment['NB_GID'] = str(auth_state['profile']['gid'])
+
+    if spawner.user.admin or auth_state['profile'].get('advanced', False):
+        spawner.environment['GRANT_SUDO'] = '1'
+
+    # spawner.environment['GIT_SSH_HOST'] = 'git.dev.dsa.lan'
+    spawner.environment['GIT_SSH_HOST'] = spawner_git_server
+
+    spawner.environment['NOTEBOOK_DIR'] = '/home/{username}/jupyter'.format(username=spawner.user.name)                                                                              
+
+    spawner.environment['GROUP_BUILD'] = ' '.join([':'.join([v, str(k)]) for k, v in auth_state['profile']['group_map'].items()])                                                    
+    spawner.environment['GROUP_MEMBER'] = ' '.join([str(x) for x in auth_state['profile']['group_membership']])                                                                      
+
+    return
+
+if auth_type == 'ldap':
+    from ldapauthenticator import LDAPAuthenticator
+    c.Authenticator.post_auth_hook = LDAPAuthenticator.build_profile
+    c.Spawner.pre_spawn_hook = spawner_config
